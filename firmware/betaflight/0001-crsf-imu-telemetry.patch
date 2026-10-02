@@ -1,0 +1,1610 @@
+From 67ca96940b52447402400ea804597c2c74ff45c6 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Fri, 2 Oct 2026 09:25:40 +0000
+Subject: [PATCH] CRSF: add IMU telemetry frame with integrated gyro/acc
+ increments
+
+Adds an optional CRSF telemetry frame that carries batched delta-angle
+(gyro) and delta-velocity (accelerometer) increments, integrated in the
+PID loop, for visual-inertial odometry on the ground.
+
+- telemetry/crsf_imu.c/.h: new PG_CRSF_IMU_CONFIG (559), accumulator
+  (multiply-add per PID loop, rounding residual carried over so the sum
+  never drifts, clipping flagged), single "ready" frame buffer where the
+  newest frame wins, and the extended-header frame serializer.
+- fc/core.c: accumulate after the motor update when enabled.
+- telemetry/crsf.c: IMU frames go ahead of the regular schedule without
+  resetting its timing; while IMU telemetry runs, regular frames are
+  divided by crsf_imu_std_tlm_div (heartbeats keep their slots with V3).
+- CLI: crsf_imu_telemetry, crsf_imu_interval_us, crsf_imu_batch,
+  crsf_imu_accel (OFF/ON/FRAME), crsf_imu_frame_type, crsf_imu_std_tlm_div.
+  Default OFF: no frame is built and the regular schedule is unchanged.
+- Unit tests for encoding, integration, saturation, sequence/drops and
+  schedule (with and without CRSF V3).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01Leo8n1DewWe3nBjGiRLMvS
+---
+ mk/source.mk                                  |   2 +
+ src/main/cli/settings.c                       |  19 +
+ src/main/cli/settings.h                       |   3 +
+ src/main/fc/core.c                            |  10 +
+ src/main/pg/pg_ids.h                          |   3 +-
+ src/main/telemetry/crsf.c                     |  38 +-
+ src/main/telemetry/crsf_imu.c                 | 318 ++++++++
+ src/main/telemetry/crsf_imu.h                 | 113 +++
+ src/test/Makefile                             |  33 +
+ src/test/unit/arming_prevention_unittest.cc   |   3 +
+ .../rx_spi_expresslrs_telemetry_unittest.cc   |   6 +
+ src/test/unit/telemetry_crsf_imu_unittest.cc  | 719 ++++++++++++++++++
+ .../unit/telemetry_crsf_imu_v3_unittest.cc    |  23 +
+ src/test/unit/telemetry_crsf_msp_unittest.cc  |   6 +
+ src/test/unit/telemetry_crsf_unittest.cc      |   6 +
+ src/test/unit/vtx_unittest.cc                 |   3 +
+ 16 files changed, 1303 insertions(+), 2 deletions(-)
+ create mode 100644 src/main/telemetry/crsf_imu.c
+ create mode 100644 src/main/telemetry/crsf_imu.h
+ create mode 100644 src/test/unit/telemetry_crsf_imu_unittest.cc
+ create mode 100644 src/test/unit/telemetry_crsf_imu_v3_unittest.cc
+
+diff --git a/mk/source.mk b/mk/source.mk
+index ccc7541..9d9d322 100644
+--- a/mk/source.mk
++++ b/mk/source.mk
+@@ -183,6 +183,7 @@ COMMON_SRC = \
+             sensors/rangefinder.c \
+             telemetry/telemetry.c \
+             telemetry/crsf.c \
++            telemetry/crsf_imu.c \
+             telemetry/ghst.c \
+             telemetry/srxl.c \
+             telemetry/frsky_hub.c \
+@@ -345,6 +346,7 @@ SPEED_OPTIMISED_SRC := $(SPEED_OPTIMISED_SRC) \
+             sensors/acceleration.c \
+             sensors/boardalignment.c \
+             sensors/gyro.c \
++            telemetry/crsf_imu.c \
+             $(CMSIS_SRC) \
+             $(DEVICE_STDPERIPH_SRC) \
+ 
+diff --git a/src/main/cli/settings.c b/src/main/cli/settings.c
+index 7c81b4c..450c824 100644
+--- a/src/main/cli/settings.c
++++ b/src/main/cli/settings.c
+@@ -128,6 +128,7 @@
+ 
+ #include "telemetry/frsky_hub.h"
+ #include "telemetry/ibus_shared.h"
++#include "telemetry/crsf_imu.h"
+ #include "telemetry/telemetry.h"
+ 
+ #include "settings.h"
+@@ -170,6 +171,12 @@ const char * const lookupTableOffOn[] = {
+     "OFF", "ON"
+ };
+ 
++#ifdef USE_TELEMETRY_CRSF
++static const char * const lookupTableCrsfImuAccel[] = {
++    "OFF", "ON", "FRAME"
++};
++#endif
++
+ static const char * const lookupTableCrashRecovery[] = {
+     "OFF", "ON" ,"BEEP", "DISARM"
+ };
+@@ -654,6 +661,9 @@ const lookupTableEntry_t lookupTables[] = {
+     LOOKUP_TABLE_ENTRY(lookupTableFreqDomain),
+     LOOKUP_TABLE_ENTRY(lookupTableSwitchMode),
+ #endif
++#ifdef USE_TELEMETRY_CRSF
++    LOOKUP_TABLE_ENTRY(lookupTableCrsfImuAccel),
++#endif
+ };
+ 
+ #undef LOOKUP_TABLE_ENTRY
+@@ -1313,6 +1323,15 @@ const clivalue_t valueTable[] = {
+ #else
+     { "telemetry_disabled_sensors", VAR_UINT32 | MASTER_VALUE, .config.u32Max = SENSOR_ALL, PG_TELEMETRY_CONFIG, offsetof(telemetryConfig_t, disabledSensors)},
+ #endif
++#ifdef USE_TELEMETRY_CRSF
++// PG_CRSF_IMU_CONFIG
++    { "crsf_imu_telemetry",         VAR_UINT8  | MASTER_VALUE | MODE_LOOKUP, .config.lookup = { TABLE_OFF_ON }, PG_CRSF_IMU_CONFIG, offsetof(crsfImuConfig_t, enabled) },
++    { "crsf_imu_interval_us",       VAR_UINT16 | MASTER_VALUE, .config.minmaxUnsigned = { CRSF_IMU_INTERVAL_US_MIN, CRSF_IMU_INTERVAL_US_MAX }, PG_CRSF_IMU_CONFIG, offsetof(crsfImuConfig_t, intervalUs) },
++    { "crsf_imu_batch",             VAR_UINT8  | MASTER_VALUE, .config.minmaxUnsigned = { 1, CRSF_IMU_BATCH_MAX }, PG_CRSF_IMU_CONFIG, offsetof(crsfImuConfig_t, batch) },
++    { "crsf_imu_accel",             VAR_UINT8  | MASTER_VALUE | MODE_LOOKUP, .config.lookup = { TABLE_CRSF_IMU_ACCEL }, PG_CRSF_IMU_CONFIG, offsetof(crsfImuConfig_t, accelMode) },
++    { "crsf_imu_frame_type",        VAR_UINT8  | MASTER_VALUE, .config.minmaxUnsigned = { 0x28, 0xFE }, PG_CRSF_IMU_CONFIG, offsetof(crsfImuConfig_t, frameType) },
++    { "crsf_imu_std_tlm_div",       VAR_UINT8  | MASTER_VALUE, .config.minmaxUnsigned = { 1, CRSF_IMU_STD_TLM_DIV_MAX }, PG_CRSF_IMU_CONFIG, offsetof(crsfImuConfig_t, stdTlmDiv) },
++#endif
+ #endif // USE_TELEMETRY
+ 
+ // PG_LED_STRIP_CONFIG
+diff --git a/src/main/cli/settings.h b/src/main/cli/settings.h
+index fef52de..3b30414 100644
+--- a/src/main/cli/settings.h
++++ b/src/main/cli/settings.h
+@@ -144,6 +144,9 @@ typedef enum {
+ #ifdef USE_RX_EXPRESSLRS
+     TABLE_FREQ_DOMAIN,
+     TABLE_SWITCH_MODE,
++#endif
++#ifdef USE_TELEMETRY_CRSF
++    TABLE_CRSF_IMU_ACCEL,
+ #endif
+     LOOKUP_TABLE_COUNT
+ } lookupTableIndex_e;
+diff --git a/src/main/fc/core.c b/src/main/fc/core.c
+index 2855f46..efbf23d 100644
+--- a/src/main/fc/core.c
++++ b/src/main/fc/core.c
+@@ -104,6 +104,7 @@
+ #include "sensors/gyro.h"
+ 
+ #include "telemetry/telemetry.h"
++#include "telemetry/crsf_imu.h"
+ 
+ #include "core.h"
+ 
+@@ -1294,6 +1295,15 @@ FAST_CODE void taskMainPidLoop(timeUs_t currentTimeUs)
+     subTaskRcCommand(currentTimeUs);
+     subTaskPidController(currentTimeUs);
+     subTaskMotorUpdate(currentTimeUs);
++#ifdef USE_TELEMETRY_CRSF
++    if (crsfImuActive) {
++#ifdef USE_ACC
++        crsfImuAccumulate(gyro.gyroADCf, acc.accADC, currentTimeUs);
++#else
++        crsfImuAccumulate(gyro.gyroADCf, NULL, currentTimeUs);
++#endif
++    }
++#endif
+     subTaskPidSubprocesses(currentTimeUs);
+ 
+     DEBUG_SET(DEBUG_CYCLETIME, 0, getTaskDeltaTimeUs(TASK_SELF));
+diff --git a/src/main/pg/pg_ids.h b/src/main/pg/pg_ids.h
+index 7a97873..38dffaf 100644
+--- a/src/main/pg/pg_ids.h
++++ b/src/main/pg/pg_ids.h
+@@ -156,7 +156,8 @@
+ #define PG_SCHEDULER_CONFIG         556
+ #define PG_MSP_CONFIG               557
+ #define PG_SOFTSERIAL_PIN_CONFIG    558
+-#define PG_BETAFLIGHT_END           558
++#define PG_CRSF_IMU_CONFIG          559
++#define PG_BETAFLIGHT_END           559
+ 
+ 
+ // OSD configuration (subject to change)
+diff --git a/src/main/telemetry/crsf.c b/src/main/telemetry/crsf.c
+index e06ba34..a4b1b63 100644
+--- a/src/main/telemetry/crsf.c
++++ b/src/main/telemetry/crsf.c
+@@ -49,6 +49,7 @@
+ #include "fc/runtime_config.h"
+ 
+ #include "flight/imu.h"
++#include "flight/pid.h"
+ #include "flight/position.h"
+ 
+ #include "io/displayport_crsf.h"
+@@ -61,11 +62,13 @@
+ #include "rx/crsf.h"
+ #include "rx/crsf_protocol.h"
+ 
++#include "sensors/acceleration.h"
+ #include "sensors/battery.h"
+ #include "sensors/sensors.h"
+ 
+ #include "telemetry/telemetry.h"
+ #include "telemetry/msp_shared.h"
++#include "telemetry/crsf_imu.h"
+ 
+ #include "crsf.h"
+ 
+@@ -663,8 +666,19 @@ static void processCrsf(void)
+     }
+ 
+     static uint8_t crsfScheduleIndex = 0;
++    static uint8_t crsfImuStdTlmCycle = 0;
+ 
+-    const uint8_t currentSchedule = crsfSchedule[crsfScheduleIndex];
++    uint8_t currentSchedule = crsfSchedule[crsfScheduleIndex];
++
++    if (crsfImuStdTlmCycle != 0) {
++        // IMU telemetry is active: regular frames are only sent every crsfImuStdTlmDiv() schedule cycles.
++        // With CRSF V3 a heartbeat takes their slot, so the receiver still gets a frame at least every 20ms.
++#if defined(USE_CRSF_V3)
++        currentSchedule = BIT(CRSF_FRAME_HEARTBEAT_INDEX);
++#else
++        currentSchedule = 0;
++#endif
++    }
+ 
+     sbuf_t crsfPayloadBuf;
+     sbuf_t *dst = &crsfPayloadBuf;
+@@ -702,6 +716,9 @@ static void processCrsf(void)
+ #endif
+ 
+     crsfScheduleIndex = (crsfScheduleIndex + 1) % crsfScheduleCount;
++    if (crsfScheduleIndex == 0) {
++        crsfImuStdTlmCycle = (crsfImuStdTlmCycle + 1) % crsfImuStdTlmDiv();
++    }
+ }
+ 
+ void crsfScheduleDeviceInfoResponse(void)
+@@ -773,6 +790,12 @@ void initCrsfTelemetry(void)
+ #if defined(USE_CRSF_CMS_TELEMETRY)
+     crsfDisplayportRegister();
+ #endif
++
++#if defined(USE_ACC)
++    crsfImuInit(targetPidLooptime, sensors(SENSOR_ACC), acc.dev.acc_1G);
++#else
++    crsfImuInit(targetPidLooptime, false, 0);
++#endif
+ }
+ 
+ bool checkCrsfTelemetryState(void)
+@@ -917,6 +940,19 @@ void handleCrsfTelemetry(timeUs_t currentTimeUs)
+     }
+ #endif
+ 
++    // IMU frames go ahead of the regular schedule, without delaying it by more than one call
++    if (crsfImuIsActive()) {
++        crsfImuFrameData_t imuFrame;
++        if (crsfImuPopFrame(&imuFrame)) {
++            sbuf_t crsfImuBuf;
++            sbuf_t *dst = &crsfImuBuf;
++            crsfInitializeFrame(dst);
++            crsfImuSerializeFrame(dst, &imuFrame, crsfImuFrameType(), crsfImuStateFlags());
++            crsfFinalize(dst);
++            return;
++        }
++    }
++
+     // Actual telemetry data only needs to be sent at a low frequency, ie 10Hz
+     // Spread out scheduled frames evenly so each frame is sent at the same frequency.
+     if (currentTimeUs >= crsfLastCycleTime + (CRSF_CYCLETIME_US / crsfScheduleCount)) {
+diff --git a/src/main/telemetry/crsf_imu.c b/src/main/telemetry/crsf_imu.c
+new file mode 100644
+index 0000000..4b6c7a6
+--- /dev/null
++++ b/src/main/telemetry/crsf_imu.c
+@@ -0,0 +1,318 @@
++/*
++ * This file is part of Betaflight.
++ *
++ * Betaflight is free software. You can redistribute this software
++ * and/or modify this software under the terms of the GNU General
++ * Public License as published by the Free Software Foundation,
++ * either version 3 of the License, or (at your option) any later
++ * version.
++ *
++ * Betaflight is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
++ *
++ * See the GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public
++ * License along with this software.
++ *
++ * If not, see <http://www.gnu.org/licenses/>.
++ */
++
++#include <stdbool.h>
++#include <stdint.h>
++#include <string.h>
++
++#include "platform.h"
++
++#ifdef USE_TELEMETRY_CRSF
++
++#include "common/axis.h"
++#include "common/maths.h"
++#include "common/streambuf.h"
++#include "common/utils.h"
++
++#include "fc/runtime_config.h"
++
++#include "pg/pg.h"
++#include "pg/pg_ids.h"
++
++#include "rx/crsf_protocol.h"
++
++#include "sensors/gyro.h"
++
++#include "telemetry/crsf_imu.h"
++
++#define CRSF_IMU_GRAVITY_MSS 9.80665f
++
++PG_REGISTER_WITH_RESET_TEMPLATE(crsfImuConfig_t, crsfImuConfig, PG_CRSF_IMU_CONFIG, 0);
++
++PG_RESET_TEMPLATE(crsfImuConfig_t, crsfImuConfig,
++    .enabled = 0,
++    .accelMode = CRSF_IMU_ACCEL_OFF,
++    .batch = CRSF_IMU_BATCH_MAX,
++    .frameType = CRSF_IMU_DEFAULT_FRAME_TYPE,
++    .intervalUs = 5000,
++    .stdTlmDiv = 5,
++);
++
++FAST_DATA_ZERO_INIT bool crsfImuActive;
++
++// state touched by the PID loop
++static FAST_DATA_ZERO_INIT struct {
++    float gyroSum[XYZ_AXIS_COUNT];      // in output LSB, carries the rounding residual
++    float accelSum[XYZ_AXIS_COUNT];     // in output LSB, carries the rounding residual
++    float gyroGain;                     // deg/s -> LSB per PID loop
++    float accelGain;                    // acc LSB -> output LSB per PID loop
++    uint16_t loopsPerInterval;
++    uint16_t loopCount;
++    uint8_t sampleCount;
++    uint8_t batchSize;
++    uint8_t accelMode;
++    uint8_t satFlags;
++} imu;
++
++static crsfImuFrameData_t workFrame;
++static crsfImuFrameData_t readyFrame;
++static bool readyValid;
++static bool dropPending;
++static uint16_t nextSeq;
++static uint16_t intervalUs;
++static uint8_t frameType;
++static uint8_t stdTlmDiv = 1;
++
++static uint8_t batchMaxForAccelMode(uint8_t accelMode)
++{
++    switch (accelMode) {
++    case CRSF_IMU_ACCEL_ON:
++        return CRSF_IMU_BATCH_MAX_ACCEL_ON;
++    case CRSF_IMU_ACCEL_FRAME:
++        return CRSF_IMU_BATCH_MAX_ACCEL_FRAME;
++    default:
++        return CRSF_IMU_BATCH_MAX_ACCEL_OFF;
++    }
++}
++
++void crsfImuInit(uint32_t pidLooptimeUs, bool accAvailable, uint16_t acc1G)
++{
++    crsfImuActive = false;
++    memset(&imu, 0, sizeof(imu));
++    memset(&workFrame, 0, sizeof(workFrame));
++    memset(&readyFrame, 0, sizeof(readyFrame));
++    readyValid = false;
++    dropPending = false;
++    nextSeq = 0;
++    stdTlmDiv = 1;
++
++    const crsfImuConfig_t *config = crsfImuConfig();
++    if (!config->enabled || pidLooptimeUs == 0) {
++        return;
++    }
++
++    uint8_t accelMode = config->accelMode;
++    if (!accAvailable || acc1G == 0 || accelMode > CRSF_IMU_ACCEL_FRAME) {
++        accelMode = CRSF_IMU_ACCEL_OFF;
++    }
++    imu.accelMode = accelMode;
++    imu.batchSize = constrain(config->batch, 1, batchMaxForAccelMode(accelMode));
++
++    // the interval is a whole number of PID loops, so every interval has exactly the same length
++    const uint32_t requestedUs = constrain(config->intervalUs, CRSF_IMU_INTERVAL_US_MIN, CRSF_IMU_INTERVAL_US_MAX);
++    uint32_t loops = (requestedUs + pidLooptimeUs / 2) / pidLooptimeUs;
++    loops = constrain(loops, 1, UINT16_MAX / pidLooptimeUs);
++    imu.loopsPerInterval = loops;
++    intervalUs = loops * pidLooptimeUs;
++
++    const float dtS = pidLooptimeUs * 1e-6f;
++    imu.gyroGain = dtS * RAD / CRSF_IMU_GYRO_SCALE_RAD;
++    if (accelMode != CRSF_IMU_ACCEL_OFF) {
++        const float accelScale = (accelMode == CRSF_IMU_ACCEL_FRAME) ? CRSF_IMU_ACCEL_FRAME_SCALE_MPS : CRSF_IMU_ACCEL_SCALE_MPS;
++        imu.accelGain = dtS * CRSF_IMU_GRAVITY_MSS / acc1G / accelScale;
++    }
++
++    frameType = config->frameType;
++    stdTlmDiv = constrain(config->stdTlmDiv, 1, CRSF_IMU_STD_TLM_DIV_MAX);
++
++    crsfImuActive = true;
++}
++
++// Round to the nearest LSB and keep the residual in the sum, so the reported
++// increments never drift from the true integral. Clipped values drop the excess.
++static int16_t crsfImuQuantize(float *sum, uint8_t *satFlags)
++{
++    const float value = *sum;
++    if (value >= (float)CRSF_IMU_RAW_MAX) {
++        *sum = 0.0f;
++        *satFlags |= CRSF_IMU_FLAG_SATURATED;
++        return CRSF_IMU_RAW_MAX;
++    }
++    if (!(value > -(float)CRSF_IMU_RAW_MAX)) { // also catches NaN
++        *sum = 0.0f;
++        *satFlags |= CRSF_IMU_FLAG_SATURATED;
++        return -CRSF_IMU_RAW_MAX;
++    }
++    const int32_t rounded = (int32_t)(value + ((value >= 0.0f) ? 0.5f : -0.5f));
++    *sum = value - (float)rounded;
++    return (int16_t)rounded;
++}
++
++static void crsfImuCompleteInterval(timeUs_t currentTimeUs)
++{
++    const uint8_t index = imu.sampleCount;
++
++    for (int axis = 0; axis < XYZ_AXIS_COUNT; axis++) {
++        workFrame.gyro[index][axis] = crsfImuQuantize(&imu.gyroSum[axis], &imu.satFlags);
++    }
++    if (imu.accelMode == CRSF_IMU_ACCEL_ON) {
++        for (int axis = 0; axis < XYZ_AXIS_COUNT; axis++) {
++            workFrame.accel[index][axis] = crsfImuQuantize(&imu.accelSum[axis], &imu.satFlags);
++        }
++    }
++
++    imu.sampleCount++;
++    if (imu.sampleCount < imu.batchSize) {
++        return;
++    }
++
++    if (imu.accelMode == CRSF_IMU_ACCEL_FRAME) {
++        for (int axis = 0; axis < XYZ_AXIS_COUNT; axis++) {
++            workFrame.accel[0][axis] = crsfImuQuantize(&imu.accelSum[axis], &imu.satFlags);
++        }
++    }
++
++    if (readyValid) {
++        // previous frame was never sent: it is replaced, newest data wins
++        dropPending = true;
++    }
++
++    workFrame.seq = nextSeq++;
++    workFrame.endTimeUs = currentTimeUs;
++    workFrame.intervalUs = intervalUs;
++    workFrame.count = imu.sampleCount;
++    workFrame.flags = imu.satFlags
++        | (dropPending ? CRSF_IMU_FLAG_FC_DROPPED : 0)
++        | (imu.accelMode << CRSF_IMU_FLAG_ACCEL_SHIFT);
++
++    readyFrame = workFrame;
++    readyValid = true;
++
++    imu.sampleCount = 0;
++    imu.satFlags = 0;
++}
++
++// Called from the PID loop after the motor update. Only multiply-adds and a
++// counter, the interval/frame bookkeeping runs once per interval.
++FAST_CODE void crsfImuAccumulate(const float gyroDps[3], const float accRaw[3], timeUs_t currentTimeUs)
++{
++    const float gyroGain = imu.gyroGain;
++    imu.gyroSum[X] += gyroDps[X] * gyroGain;
++    imu.gyroSum[Y] += gyroDps[Y] * gyroGain;
++    imu.gyroSum[Z] += gyroDps[Z] * gyroGain;
++
++    if (imu.accelMode != CRSF_IMU_ACCEL_OFF) {
++        const float accelGain = imu.accelGain;
++        imu.accelSum[X] += accRaw[X] * accelGain;
++        imu.accelSum[Y] += accRaw[Y] * accelGain;
++        imu.accelSum[Z] += accRaw[Z] * accelGain;
++    }
++
++    if (++imu.loopCount < imu.loopsPerInterval) {
++        return;
++    }
++    imu.loopCount = 0;
++
++    crsfImuCompleteInterval(currentTimeUs);
++}
++
++bool crsfImuIsActive(void)
++{
++    return crsfImuActive;
++}
++
++bool crsfImuPopFrame(crsfImuFrameData_t *frame)
++{
++    if (!readyValid) {
++        return false;
++    }
++    *frame = readyFrame;
++    readyValid = false;
++    dropPending = false;
++    return true;
++}
++
++uint8_t crsfImuStateFlags(void)
++{
++    uint8_t flags = 0;
++    if (ARMING_FLAG(ARMED)) {
++        flags |= CRSF_IMU_FLAG_ARMED;
++    }
++    if (FLIGHT_MODE(ANGLE_MODE)) {
++        flags |= CRSF_IMU_FLAG_ANGLE_MODE;
++    }
++    if (!gyroIsCalibrationComplete()) {
++        flags |= CRSF_IMU_FLAG_GYRO_NOT_READY;
++    }
++    return flags;
++}
++
++uint8_t crsfImuStdTlmDiv(void)
++{
++    return crsfImuActive ? stdTlmDiv : 1;
++}
++
++uint8_t crsfImuFrameType(void)
++{
++    return frameType;
++}
++
++uint16_t crsfImuIntervalUs(void)
++{
++    return intervalUs;
++}
++
++uint8_t crsfImuBatchSize(void)
++{
++    return imu.batchSize;
++}
++
++void crsfImuSerializeFrame(sbuf_t *dst, const crsfImuFrameData_t *frame, uint8_t type, uint8_t stateFlags)
++{
++    const uint8_t accelMode = (frame->flags & CRSF_IMU_FLAG_ACCEL_MASK) >> CRSF_IMU_FLAG_ACCEL_SHIFT;
++    const uint8_t count = MIN(frame->count, batchMaxForAccelMode(accelMode));
++
++    uint8_t dataSize = CRSF_IMU_HEADER_SIZE + count * CRSF_IMU_VECTOR_SIZE;
++    if (accelMode == CRSF_IMU_ACCEL_ON) {
++        dataSize += count * CRSF_IMU_VECTOR_SIZE;
++    } else if (accelMode == CRSF_IMU_ACCEL_FRAME) {
++        dataSize += CRSF_IMU_VECTOR_SIZE;
++    }
++
++    sbufWriteU8(dst, dataSize + CRSF_FRAME_LENGTH_EXT_TYPE_CRC);
++    sbufWriteU8(dst, type);
++    sbufWriteU8(dst, CRSF_ADDRESS_RADIO_TRANSMITTER);
++    sbufWriteU8(dst, CRSF_ADDRESS_FLIGHT_CONTROLLER);
++
++    sbufWriteU8(dst, CRSF_IMU_FORMAT_VERSION);
++    sbufWriteU8(dst, frame->flags | stateFlags);
++    sbufWriteU16BigEndian(dst, frame->seq);
++    sbufWriteU32BigEndian(dst, frame->endTimeUs);
++    sbufWriteU16BigEndian(dst, frame->intervalUs);
++
++    for (int i = 0; i < count; i++) {
++        for (int axis = 0; axis < XYZ_AXIS_COUNT; axis++) {
++            sbufWriteU16BigEndian(dst, (uint16_t)frame->gyro[i][axis]);
++        }
++        if (accelMode == CRSF_IMU_ACCEL_ON) {
++            for (int axis = 0; axis < XYZ_AXIS_COUNT; axis++) {
++                sbufWriteU16BigEndian(dst, (uint16_t)frame->accel[i][axis]);
++            }
++        }
++    }
++    if (accelMode == CRSF_IMU_ACCEL_FRAME) {
++        for (int axis = 0; axis < XYZ_AXIS_COUNT; axis++) {
++            sbufWriteU16BigEndian(dst, (uint16_t)frame->accel[0][axis]);
++        }
++    }
++}
++
++#endif // USE_TELEMETRY_CRSF
+diff --git a/src/main/telemetry/crsf_imu.h b/src/main/telemetry/crsf_imu.h
+new file mode 100644
+index 0000000..42ae012
+--- /dev/null
++++ b/src/main/telemetry/crsf_imu.h
+@@ -0,0 +1,113 @@
++/*
++ * This file is part of Betaflight.
++ *
++ * Betaflight is free software. You can redistribute this software
++ * and/or modify this software under the terms of the GNU General
++ * Public License as published by the Free Software Foundation,
++ * either version 3 of the License, or (at your option) any later
++ * version.
++ *
++ * Betaflight is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
++ *
++ * See the GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public
++ * License along with this software.
++ *
++ * If not, see <http://www.gnu.org/licenses/>.
++ */
++
++/*
++ * CRSF IMU telemetry: integrated gyro (delta angle) and accelerometer
++ * (delta velocity) increments, batched into one extended-header CRSF frame.
++ * The wire format is documented in IMU_FRAME_SPEC.md, distributed with this patch.
++ */
++
++#pragma once
++
++#include <stdbool.h>
++#include <stdint.h>
++
++#include "common/streambuf.h"
++#include "common/time.h"
++
++#include "pg/pg.h"
++
++typedef enum {
++    CRSF_IMU_ACCEL_OFF = 0,     // gyro only
++    CRSF_IMU_ACCEL_ON,          // delta velocity for every interval
++    CRSF_IMU_ACCEL_FRAME,       // one delta velocity over the whole frame
++} crsfImuAccelMode_e;
++
++typedef struct crsfImuConfig_s {
++    uint8_t enabled;            // OFF / ON
++    uint8_t accelMode;          // crsfImuAccelMode_e
++    uint8_t batch;              // intervals per frame (clamped to what fits the frame)
++    uint8_t frameType;          // CRSF frame type used for the IMU frame
++    uint16_t intervalUs;        // integration interval
++    uint8_t stdTlmDiv;          // divider for the regular CRSF telemetry while IMU telemetry is on
++} crsfImuConfig_t;
++
++PG_DECLARE(crsfImuConfig_t, crsfImuConfig);
++
++#define CRSF_IMU_FORMAT_VERSION         1
++#define CRSF_IMU_DEFAULT_FRAME_TYPE     0x7F
++
++#define CRSF_IMU_INTERVAL_US_MIN        1000
++#define CRSF_IMU_INTERVAL_US_MAX        20000
++#define CRSF_IMU_BATCH_MAX              8
++#define CRSF_IMU_STD_TLM_DIV_MAX        20
++
++// data bytes after the extended header (destination, origin)
++#define CRSF_IMU_HEADER_SIZE            10
++#define CRSF_IMU_DATA_SIZE_MAX          58  // CRSF_FRAME_SIZE_MAX - sync, len, type, dest, orig, crc
++#define CRSF_IMU_VECTOR_SIZE            6   // 3 x int16
++
++// maximum number of intervals per frame for each accelerometer mode
++#define CRSF_IMU_BATCH_MAX_ACCEL_OFF    8   // 10 + 8 * 6  = 58
++#define CRSF_IMU_BATCH_MAX_ACCEL_ON     4   // 10 + 4 * 12 = 58
++#define CRSF_IMU_BATCH_MAX_ACCEL_FRAME  7   // 10 + 7 * 6 + 6 = 58
++
++// fixed point scales (value = raw * scale)
++#define CRSF_IMU_GYRO_SCALE_RAD         1e-4f   // delta angle, rad per LSB
++#define CRSF_IMU_ACCEL_SCALE_MPS        1e-4f   // delta velocity per interval, m/s per LSB
++#define CRSF_IMU_ACCEL_FRAME_SCALE_MPS  1e-3f   // delta velocity per frame, m/s per LSB
++#define CRSF_IMU_RAW_MAX                32767
++
++// flags byte
++#define CRSF_IMU_FLAG_ARMED             (1 << 0)
++#define CRSF_IMU_FLAG_ANGLE_MODE        (1 << 1)
++#define CRSF_IMU_FLAG_GYRO_NOT_READY    (1 << 2)    // gyro calibration in progress, data invalid
++#define CRSF_IMU_FLAG_SATURATED         (1 << 3)    // at least one value in this frame was clipped
++#define CRSF_IMU_FLAG_FC_DROPPED        (1 << 4)    // FC discarded at least one frame since the previous sent one
++#define CRSF_IMU_FLAG_ACCEL_SHIFT       5           // bits 5..6: crsfImuAccelMode_e
++#define CRSF_IMU_FLAG_ACCEL_MASK        (3 << CRSF_IMU_FLAG_ACCEL_SHIFT)
++
++typedef struct crsfImuFrameData_s {
++    uint16_t seq;
++    uint32_t endTimeUs;
++    uint16_t intervalUs;
++    uint8_t flags;              // SATURATED, FC_DROPPED and accel mode bits
++    uint8_t count;              // number of intervals
++    int16_t gyro[CRSF_IMU_BATCH_MAX][3];
++    int16_t accel[CRSF_IMU_BATCH_MAX][3];   // ACCEL_ON: one per interval, ACCEL_FRAME: accel[0] only
++} crsfImuFrameData_t;
++
++// true when IMU telemetry is configured and running; checked by the PID loop before accumulating
++extern bool crsfImuActive;
++
++void crsfImuInit(uint32_t pidLooptimeUs, bool accAvailable, uint16_t acc1G);
++void crsfImuAccumulate(const float gyroDps[3], const float accRaw[3], timeUs_t currentTimeUs);
++
++bool crsfImuIsActive(void);
++bool crsfImuPopFrame(crsfImuFrameData_t *frame);
++uint8_t crsfImuStateFlags(void);
++uint8_t crsfImuStdTlmDiv(void);
++uint8_t crsfImuFrameType(void);
++uint16_t crsfImuIntervalUs(void);
++uint8_t crsfImuBatchSize(void);
++
++// writes length, type, extended header and data; the caller adds sync byte and CRC
++void crsfImuSerializeFrame(sbuf_t *dst, const crsfImuFrameData_t *frame, uint8_t frameType, uint8_t stateFlags);
+diff --git a/src/test/Makefile b/src/test/Makefile
+index f5dbca9..7f9bc0c 100644
+--- a/src/test/Makefile
++++ b/src/test/Makefile
+@@ -316,6 +316,7 @@ sensor_gyro_unittest_SRC := \
+ telemetry_crsf_unittest_SRC := \
+ 		$(USER_DIR)/rx/crsf.c \
+ 		$(USER_DIR)/telemetry/crsf.c \
++		$(USER_DIR)/telemetry/crsf_imu.c \
+ 		$(USER_DIR)/common/crc.c \
+ 		$(USER_DIR)/common/maths.c \
+ 		$(USER_DIR)/common/streambuf.c \
+@@ -330,6 +331,36 @@ telemetry_crsf_unittest_DEFINES := \
+ 		__REVISION__="revision"
+ 
+ 
++telemetry_crsf_imu_unittest_SRC := \
++		$(USER_DIR)/rx/crsf.c \
++		$(USER_DIR)/telemetry/crsf.c \
++		$(USER_DIR)/telemetry/crsf_imu.c \
++		$(USER_DIR)/common/crc.c \
++		$(USER_DIR)/common/maths.c \
++		$(USER_DIR)/common/streambuf.c \
++		$(USER_DIR)/common/gps_conversion.c \
++		$(USER_DIR)/common/printf.c \
++		$(USER_DIR)/common/typeconversion.c \
++		$(USER_DIR)/fc/runtime_config.c
++
++telemetry_crsf_imu_unittest_DEFINES := \
++		FLASH_SIZE=128 \
++		__TARGET__="TEST" \
++		__REVISION__="revision"
++
++
++telemetry_crsf_imu_v3_unittest_SRC := \
++		$(telemetry_crsf_imu_unittest_SRC) \
++		$(USER_DIR)/build/atomic.c \
++		$(USER_DIR)/telemetry/msp_shared.c
++
++telemetry_crsf_imu_v3_unittest_DEFINES := \
++		$(telemetry_crsf_imu_unittest_DEFINES) \
++		USE_MSP_OVER_TELEMETRY= \
++		USE_CRSF_V3=
++
++
++
+ telemetry_crsf_msp_unittest_SRC := \
+ 		$(USER_DIR)/rx/crsf.c \
+ 		$(USER_DIR)/build/atomic.c \
+@@ -340,6 +371,7 @@ telemetry_crsf_msp_unittest_SRC := \
+ 		$(USER_DIR)/drivers/serial.c \
+ 		$(USER_DIR)/common/typeconversion.c \
+ 		$(USER_DIR)/telemetry/crsf.c \
++		$(USER_DIR)/telemetry/crsf_imu.c \
+ 		$(USER_DIR)/common/gps_conversion.c \
+ 		$(USER_DIR)/telemetry/msp_shared.c \
+ 		$(USER_DIR)/fc/runtime_config.c
+@@ -440,6 +472,7 @@ rx_spi_expresslrs_unittest_DEFINES := \
+ rx_spi_expresslrs_telemetry_unittest_SRC := \
+ 		$(USER_DIR)/rx/crsf.c \
+ 		$(USER_DIR)/telemetry/crsf.c \
++		$(USER_DIR)/telemetry/crsf_imu.c \
+ 		$(USER_DIR)/common/crc.c \
+ 		$(USER_DIR)/common/maths.c \
+ 		$(USER_DIR)/common/streambuf.c \
+diff --git a/src/test/unit/arming_prevention_unittest.cc b/src/test/unit/arming_prevention_unittest.cc
+index 7e51c4e..3735191 100644
+--- a/src/test/unit/arming_prevention_unittest.cc
++++ b/src/test/unit/arming_prevention_unittest.cc
+@@ -1049,6 +1049,9 @@ TEST(ArmingPreventionTest, Paralyze)
+ 
+ // STUBS
+ extern "C" {
++    bool crsfImuActive = false;
++    gyro_t gyro;
++    void crsfImuAccumulate(const float *, const float *, timeUs_t) {}
+     uint32_t micros(void) { return simulationTime; }
+     uint32_t millis(void) { return micros() / 1000; }
+     bool rxIsReceivingSignal(void) { return simulationHaveRx; }
+diff --git a/src/test/unit/rx_spi_expresslrs_telemetry_unittest.cc b/src/test/unit/rx_spi_expresslrs_telemetry_unittest.cc
+index 40bae84..0029c03 100644
+--- a/src/test/unit/rx_spi_expresslrs_telemetry_unittest.cc
++++ b/src/test/unit/rx_spi_expresslrs_telemetry_unittest.cc
+@@ -390,6 +390,12 @@ TEST(RxSpiExpressLrsTelemetryUnitTest, TestDeviceInfoResp)
+ 
+ extern "C" {
+ 
++// CRSF IMU telemetry dependencies
++uint32_t targetPidLooptime;
++acc_t acc;
++bool gyroIsCalibrationComplete(void) { return true; }
++
++
+     attitudeEulerAngles_t attitude = { { 0, 0, 0 } };     // absolute angle inclination in multiple of 0.1 degree    180 deg = 1800
+     gpsSolutionData_t gpsSol;
+     rssiSource_e rssiSource;
+diff --git a/src/test/unit/telemetry_crsf_imu_unittest.cc b/src/test/unit/telemetry_crsf_imu_unittest.cc
+new file mode 100644
+index 0000000..d965e2b
+--- /dev/null
++++ b/src/test/unit/telemetry_crsf_imu_unittest.cc
+@@ -0,0 +1,719 @@
++/*
++ * This file is part of Betaflight.
++ *
++ * Betaflight is free software. You can redistribute this software
++ * and/or modify this software under the terms of the GNU General
++ * Public License as published by the Free Software Foundation,
++ * either version 3 of the License, or (at your option) any later
++ * version.
++ *
++ * Betaflight is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
++ *
++ * See the GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public
++ * License along with this software.
++ *
++ * If not, see <http://www.gnu.org/licenses/>.
++ */
++
++#include <stdbool.h>
++#include <stdint.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++
++#include <cmath>
++#include <vector>
++
++extern "C" {
++    #include <platform.h>
++
++    #include "build/debug.h"
++
++    #include "common/axis.h"
++    #include "common/crc.h"
++    #include "common/maths.h"
++    #include "common/streambuf.h"
++
++    #include "pg/pg.h"
++    #include "pg/pg_ids.h"
++    #include "pg/rx.h"
++
++    #include "drivers/serial.h"
++    #include "drivers/system.h"
++
++    #include "config/config.h"
++    #include "fc/runtime_config.h"
++
++    #include "flight/pid.h"
++    #include "flight/imu.h"
++
++    #include "io/gps.h"
++    #include "io/serial.h"
++
++    #include "rx/rx.h"
++    #include "rx/crsf.h"
++
++    #include "sensors/battery.h"
++    #include "sensors/sensors.h"
++    #include "sensors/acceleration.h"
++
++    #include "telemetry/crsf.h"
++    #include "telemetry/crsf_imu.h"
++    #include "telemetry/telemetry.h"
++    #include "telemetry/msp_shared.h"
++
++    #include "drivers/persistent.h"
++    #include "msp/msp.h"
++
++    rssiSource_e rssiSource;
++
++    PG_REGISTER(batteryConfig_t, batteryConfig, PG_BATTERY_CONFIG, 0);
++    PG_REGISTER(telemetryConfig_t, telemetryConfig, PG_TELEMETRY_CONFIG, 0);
++    PG_REGISTER(systemConfig_t, systemConfig, PG_SYSTEM_CONFIG, 0);
++    PG_REGISTER(rxConfig_t, rxConfig, PG_RX_CONFIG, 0);
++    PG_REGISTER(accelerometerConfig_t, accelerometerConfig, PG_ACCELEROMETER_CONFIG, 0);
++}
++
++#include "unittest_macros.h"
++#include "gtest/gtest.h"
++
++// ---------------------------------------------------------------------------
++// test harness: a fake CRSF serial port that records every frame written to it
++
++struct CapturedFrame {
++    uint32_t timeUs;
++    std::vector<uint8_t> bytes;
++    uint8_t type() const { return bytes[2]; }
++};
++
++static std::vector<CapturedFrame> capturedFrames;
++static uint32_t testTimeUs = 1000000;   // monotonic across all tests, the telemetry code keeps static timestamps
++static bool gyroCalibrated = true;
++
++static const float accOneG = 2048.0f;   // ICM42688P acc_1G
++
++static void advanceTo(uint32_t timeUs)
++{
++    testTimeUs = timeUs;
++}
++
++static void startCrsfTelemetry(void)
++{
++    static rxRuntimeState_t rxRuntimeState;
++    crsfRxInit(rxConfig(), &rxRuntimeState);
++    sensorsSet(SENSOR_ACC);
++    acc.dev.acc_1G = (uint16_t)accOneG;
++    targetPidLooptime = 250;    // 8 kHz gyro, pid_process_denom 2
++    initCrsfTelemetry();
++    capturedFrames.clear();
++}
++
++static void configureImu(bool enabled, uint16_t intervalUs, uint8_t batch, uint8_t accelMode, uint8_t stdTlmDiv)
++{
++    crsfImuConfigMutable()->enabled = enabled;
++    crsfImuConfigMutable()->intervalUs = intervalUs;
++    crsfImuConfigMutable()->batch = batch;
++    crsfImuConfigMutable()->accelMode = accelMode;
++    crsfImuConfigMutable()->frameType = CRSF_IMU_DEFAULT_FRAME_TYPE;
++    crsfImuConfigMutable()->stdTlmDiv = stdTlmDiv;
++}
++
++// Runs the PID loop (every 250us) and the telemetry task (every 2ms) for durationUs.
++static void runLoops(uint32_t durationUs, const float gyroDps[3], const float accRaw[3])
++{
++    const uint32_t end = testTimeUs + durationUs;
++    while (testTimeUs < end) {
++        testTimeUs += 250;
++        if (crsfImuActive) {
++            crsfImuAccumulate(gyroDps, accRaw, testTimeUs);
++        }
++        if (testTimeUs % 2000 == 0) {
++            handleCrsfTelemetry(testTimeUs);
++        }
++    }
++    handleCrsfTelemetry(testTimeUs); // flush whatever was queued last
++}
++
++static uint8_t referenceCrc8D5(const uint8_t *data, int len)
++{
++    // bitwise CRC-8 poly 0xD5, independent of common/crc.c
++    uint8_t crc = 0;
++    for (int i = 0; i < len; i++) {
++        crc ^= data[i];
++        for (int bit = 0; bit < 8; bit++) {
++            crc = (crc & 0x80) ? (uint8_t)((crc << 1) ^ 0xD5) : (uint8_t)(crc << 1);
++        }
++    }
++    return crc;
++}
++
++static void expectValidCrsfFrame(const std::vector<uint8_t> &frame)
++{
++    ASSERT_GE(frame.size(), 4u);
++    EXPECT_LE(frame.size(), (size_t)CRSF_FRAME_SIZE_MAX);
++    EXPECT_EQ(CRSF_SYNC_BYTE, frame[0]);
++    EXPECT_EQ(frame.size(), (size_t)frame[1] + 2);
++    EXPECT_EQ(referenceCrc8D5(&frame[2], frame.size() - 3), frame.back());
++}
++
++static int16_t be16(const uint8_t *p) { return (int16_t)((p[0] << 8) | p[1]); }
++static uint16_t beU16(const uint8_t *p) { return (uint16_t)((p[0] << 8) | p[1]); }
++static uint32_t beU32(const uint8_t *p) { return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) | ((uint32_t)p[2] << 8) | p[3]; }
++
++static std::vector<uint8_t> serializeWithSyncAndCrc(const crsfImuFrameData_t *data, uint8_t frameType, uint8_t stateFlags)
++{
++    uint8_t buf[CRSF_FRAME_SIZE_MAX + 8];
++    sbuf_t sbuf;
++    sbuf_t *dst = sbufInit(&sbuf, buf, buf + sizeof(buf));
++    sbufWriteU8(dst, CRSF_SYNC_BYTE);
++    crsfImuSerializeFrame(dst, data, frameType, stateFlags);
++    crc8_dvb_s2_sbuf_append(dst, &buf[2]);
++    return std::vector<uint8_t>(buf, dst->ptr);
++}
++
++static std::vector<uint8_t> hexToBytes(const char *hex)
++{
++    std::vector<uint8_t> out;
++    while (*hex) {
++        if (*hex == ' ') {
++            hex++;
++            continue;
++        }
++        char byteStr[3] = { hex[0], hex[1], 0 };
++        out.push_back((uint8_t)strtoul(byteStr, NULL, 16));
++        hex += 2;
++    }
++    return out;
++}
++
++static void dumpFrame(const char *name, const std::vector<uint8_t> &frame)
++{
++    printf("%s len=%u", name, (unsigned)frame.size());
++    for (uint8_t b : frame) {
++        printf(" %02X", b);
++    }
++    printf("\n");
++}
++
++static int countType(uint8_t type)
++{
++    int n = 0;
++    for (const CapturedFrame &f : capturedFrames) {
++        n += (f.type() == type);
++    }
++    return n;
++}
++
++// ---------------------------------------------------------------------------
++// 1. Telemetry OFF: no IMU frame, regular schedule identical to stock 4.5.0.
++//    Must run first, so the static schedule index in telemetry/crsf.c starts at 0.
++
++TEST(TelemetryCrsfImuTest, OffKeepsStockSchedule)
++{
++    configureImu(false, 5000, 8, CRSF_IMU_ACCEL_OFF, 5);
++    startCrsfTelemetry();
++    EXPECT_FALSE(crsfImuActive);
++    EXPECT_EQ(1, crsfImuStdTlmDiv());
++
++    const float gyroDps[3] = { 100.0f, 200.0f, 300.0f };
++    const float accRaw[3] = { 0.0f, 0.0f, accOneG };
++    advanceTo(2000000);
++    runLoops(2000000, gyroDps, accRaw);
++
++#if defined(USE_CRSF_V3)
++    // stock schedule with CRSF V3: attitude, battery, flight mode, GPS and a heartbeat, one slot every 20ms
++    const uint8_t expectedOrder[] = { 0x1E, 0x08, 0x21, 0x02, 0x0B };
++    const uint32_t expectedSpacingUs = 20000;
++#else
++    // stock schedule for this test target: attitude, battery, flight mode, GPS round robin,
++    // one frame per 100ms / 4 slots, i.e. the first 2ms tick after 25ms -> every 26ms
++    const uint8_t expectedOrder[] = { 0x1E, 0x08, 0x21, 0x02 };
++    const uint32_t expectedSpacingUs = 26000;
++#endif
++    const size_t slots = ARRAYLEN(expectedOrder);
++    ASSERT_GT(capturedFrames.size(), 70u);
++    for (size_t i = 0; i < capturedFrames.size(); i++) {
++        EXPECT_EQ(expectedOrder[i % slots], capturedFrames[i].type()) << "frame " << i;
++        expectValidCrsfFrame(capturedFrames[i].bytes);
++        if (i > 0) {
++            EXPECT_EQ(expectedSpacingUs, capturedFrames[i].timeUs - capturedFrames[i - 1].timeUs) << "frame " << i;
++        }
++    }
++    EXPECT_EQ(0, countType(CRSF_IMU_DEFAULT_FRAME_TYPE));
++
++    if (getenv("CRSF_SCHEDULE_DUMP")) {
++        // used to diff this schedule against the same harness built from unmodified 4.5.0 sources
++        FILE *f = fopen(getenv("CRSF_SCHEDULE_DUMP"), "w");
++        for (const CapturedFrame &frame : capturedFrames) {
++            fprintf(f, "%u", frame.timeUs);
++            for (uint8_t b : frame.bytes) {
++                fprintf(f, " %02X", b);
++            }
++            fprintf(f, "\n");
++        }
++        fclose(f);
++    }
++
++    // the PID loop hook is a no-op when OFF
++    capturedFrames.clear();
++    runLoops(100000, gyroDps, accRaw);
++    crsfImuFrameData_t frame;
++    EXPECT_FALSE(crsfImuPopFrame(&frame));
++}
++
++// ---------------------------------------------------------------------------
++// 2. Frame encoding: known values -> exact bytes (vectors from the independent Python encoder)
++
++struct EncodingVector {
++    uint8_t frameType;
++    uint8_t stateFlags;     // ARMED / ANGLE / GYRO_NOT_READY, added at send time
++    uint8_t frameFlags;     // SATURATED / FC_DROPPED, set by the accumulator
++    uint8_t accelMode;
++    uint16_t seq;
++    uint32_t endTimeUs;
++    uint16_t intervalUs;
++    uint8_t count;
++    int16_t gyro[8][3];
++    int16_t accel[8][3];
++    const char *hex;
++};
++
++static const EncodingVector encodingVectors[] = {
++    { 0x7F, CRSF_IMU_FLAG_ARMED, 0, CRSF_IMU_ACCEL_OFF, 41, 12345678, 5000, 8,
++      { { 87, -44, 436 }, { 88, -43, 437 }, { 87, -44, 436 }, { 87, -44, 437 },
++        { 88, -44, 436 }, { 87, -43, 436 }, { 87, -44, 437 }, { 88, -44, 436 } }, { },
++      "C8 3E 7F EA C8 01 01 00 29 00 BC 61 4E 13 88 00 57 FF D4 01 B4 00 58 FF D5 01 B5 00 57 FF D4 01 B4 00 57 FF D4 01 B5 00 58 FF D4 01 B4 00 57 FF D5 01 B4 00 57 FF D4 01 B5 00 58 FF D4 01 B4 7D" },
++    { 0x7F, CRSF_IMU_FLAG_ARMED | CRSF_IMU_FLAG_ANGLE_MODE, 0, CRSF_IMU_ACCEL_ON, 65535, 4000000000u, 2500, 4,
++      { { 0, 0, 0 }, { 1, 0, -1 }, { 0, -1, 0 }, { -1, 1, 1 } },
++      { { 3, -2, 245 }, { 2, -1, 245 }, { 3, -2, 246 }, { 2, -2, 245 } },
++      "C8 3E 7F EA C8 01 23 FF FF EE 6B 28 00 09 C4 00 00 00 00 00 00 00 03 FF FE 00 F5 00 01 00 00 FF FF 00 02 FF FF 00 F5 00 00 FF FF 00 00 00 03 FF FE 00 F6 FF FF 00 01 00 01 00 02 FF FE 00 F5 6D" },
++    { 0x7F, 0, 0, CRSF_IMU_ACCEL_FRAME, 1000, 60000000, 7500, 7,
++      { { 0, 262, 0 }, { 0, 262, 0 }, { 0, 261, 0 }, { 0, 262, 0 }, { 0, 262, 0 }, { 0, 262, 0 }, { 0, 261, 0 } },
++      { { -12, 0, 515 } },
++      "C8 3E 7F EA C8 01 40 03 E8 03 93 87 00 1D 4C 00 00 01 06 00 00 00 00 01 06 00 00 00 00 01 05 00 00 00 00 01 06 00 00 00 00 01 06 00 00 00 00 01 06 00 00 00 00 01 05 00 00 FF F4 00 00 02 03 BF" },
++    { 0x7F, CRSF_IMU_FLAG_GYRO_NOT_READY, CRSF_IMU_FLAG_SATURATED | CRSF_IMU_FLAG_FC_DROPPED, CRSF_IMU_ACCEL_OFF, 7, 1500000, 20000, 2,
++      { { 32767, -32767, 0 }, { -32767, 32767, 12345 } }, { },
++      "C8 1A 7F EA C8 01 1C 00 07 00 16 E3 60 4E 20 7F FF 80 01 00 00 80 01 7F FF 30 39 1C" },
++    { 0x80, CRSF_IMU_FLAG_ARMED, 0, CRSF_IMU_ACCEL_OFF, 0, 0xFFFFFFF0u, 1000, 1,
++      { { -1, -2, -3 } }, { },
++      "C8 14 80 EA C8 01 01 00 00 FF FF FF F0 03 E8 FF FF FF FE FF FD F8" },
++};
++
++TEST(TelemetryCrsfImuTest, EncodingMatchesReferenceVectors)
++{
++    int index = 1;
++    for (const EncodingVector &v : encodingVectors) {
++        crsfImuFrameData_t data;
++        memset(&data, 0, sizeof(data));
++        data.seq = v.seq;
++        data.endTimeUs = v.endTimeUs;
++        data.intervalUs = v.intervalUs;
++        data.count = v.count;
++        data.flags = v.frameFlags | (v.accelMode << CRSF_IMU_FLAG_ACCEL_SHIFT);
++        memcpy(data.gyro, v.gyro, sizeof(data.gyro));
++        memcpy(data.accel, v.accel, sizeof(data.accel));
++
++        const std::vector<uint8_t> frame = serializeWithSyncAndCrc(&data, v.frameType, v.stateFlags);
++        expectValidCrsfFrame(frame);
++        EXPECT_EQ(hexToBytes(v.hex), frame) << "vector " << index;
++
++        char name[16];
++        snprintf(name, sizeof(name), "V%d", index);
++        dumpFrame(name, frame);
++        index++;
++    }
++}
++
++TEST(TelemetryCrsfImuTest, FullFramesFitIn64Bytes)
++{
++    const uint8_t modes[] = { CRSF_IMU_ACCEL_OFF, CRSF_IMU_ACCEL_ON, CRSF_IMU_ACCEL_FRAME };
++    for (uint8_t mode : modes) {
++        crsfImuFrameData_t data;
++        memset(&data, 0, sizeof(data));
++        data.count = CRSF_IMU_BATCH_MAX;   // more than fits: serializer must clamp
++        data.flags = mode << CRSF_IMU_FLAG_ACCEL_SHIFT;
++        const std::vector<uint8_t> frame = serializeWithSyncAndCrc(&data, 0x7F, 0);
++        EXPECT_EQ((size_t)CRSF_FRAME_SIZE_MAX, frame.size()) << "mode " << (int)mode;
++        EXPECT_EQ(62, frame[1]);
++    }
++}
++
++// ---------------------------------------------------------------------------
++// 3. Integration: constant rate over many loops -> exact integral, no rounding drift
++
++static std::vector<crsfImuFrameData_t> runAccumulator(uint32_t loops, const float gyroDps[3], const float accRaw[3])
++{
++    std::vector<crsfImuFrameData_t> frames;
++    uint32_t t = 0;
++    for (uint32_t i = 0; i < loops; i++) {
++        t += 250;
++        crsfImuAccumulate(gyroDps, accRaw, t);
++        crsfImuFrameData_t frame;
++        if (crsfImuPopFrame(&frame)) {
++            frames.push_back(frame);
++        }
++    }
++    return frames;
++}
++
++TEST(TelemetryCrsfImuTest, ConstantRateIntegratesWithoutDrift)
++{
++    configureImu(true, 5000, 8, CRSF_IMU_ACCEL_ON, 5);
++    crsfImuInit(250, true, (uint16_t)accOneG);
++    ASSERT_TRUE(crsfImuActive);
++    EXPECT_EQ(5000, crsfImuIntervalUs());
++    EXPECT_EQ(4, crsfImuBatchSize());   // ACCEL_ON fits 4 intervals
++
++    const float gyroDps[3] = { 123.4f, -45.6f, 777.7f };
++    const float accRaw[3] = { 0.1f * accOneG, -0.25f * accOneG, 1.0f * accOneG };
++    const uint32_t loops = 40000; // 10 s at 4 kHz
++    const std::vector<crsfImuFrameData_t> frames = runAccumulator(loops, gyroDps, accRaw);
++
++    ASSERT_EQ(loops / 20 / 4, frames.size());
++    double sumGyro[3] = { 0, 0, 0 };
++    double sumAcc[3] = { 0, 0, 0 };
++    for (const crsfImuFrameData_t &frame : frames) {
++        EXPECT_EQ(4, frame.count);
++        EXPECT_EQ(0, frame.flags & (CRSF_IMU_FLAG_SATURATED | CRSF_IMU_FLAG_FC_DROPPED));
++        for (int i = 0; i < frame.count; i++) {
++            for (int axis = 0; axis < 3; axis++) {
++                sumGyro[axis] += frame.gyro[i][axis];
++                sumAcc[axis] += frame.accel[i][axis];
++                // each interval within 1 LSB of the exact per-interval increment
++                const double exactGyro = gyroDps[axis] * M_PI / 180.0 * 0.005 / 1e-4;
++                EXPECT_NEAR(exactGyro, frame.gyro[i][axis], 1.0);
++            }
++        }
++    }
++    const double seconds = loops * 250e-6;
++    for (int axis = 0; axis < 3; axis++) {
++        const double exactAngle = gyroDps[axis] * M_PI / 180.0 * seconds / 1e-4;            // LSB
++        const double exactVelocity = accRaw[axis] / accOneG * 9.80665 * seconds / 1e-4;    // LSB
++        // error feedback keeps the total within one LSB (float accumulation adds a tiny bit)
++        EXPECT_NEAR(exactAngle, sumGyro[axis], 1.0) << "axis " << axis;
++        EXPECT_NEAR(exactVelocity, sumAcc[axis], 1.0) << "axis " << axis;
++    }
++}
++
++TEST(TelemetryCrsfImuTest, AccelPerFrameMode)
++{
++    configureImu(true, 7500, 8, CRSF_IMU_ACCEL_FRAME, 5);
++    crsfImuInit(250, true, (uint16_t)accOneG);
++    EXPECT_EQ(7500, crsfImuIntervalUs());
++    EXPECT_EQ(7, crsfImuBatchSize());
++
++    const float gyroDps[3] = { 0.0f, 200.0f, 0.0f };
++    const float accRaw[3] = { 0.0f, 0.0f, accOneG };
++    const std::vector<crsfImuFrameData_t> frames = runAccumulator(30 * 7 * 10, gyroDps, accRaw);
++    ASSERT_EQ(10u, frames.size());
++    for (const crsfImuFrameData_t &frame : frames) {
++        EXPECT_EQ(CRSF_IMU_ACCEL_FRAME, (frame.flags & CRSF_IMU_FLAG_ACCEL_MASK) >> CRSF_IMU_FLAG_ACCEL_SHIFT);
++        // 1 g over 7 x 7.5ms = 0.5148 m/s at 1e-3 m/s per LSB
++        EXPECT_NEAR(514.85, frame.accel[0][Z], 1.0);
++        EXPECT_NEAR(0, frame.accel[0][X], 0.5);
++        for (int i = 0; i < frame.count; i++) {
++            EXPECT_NEAR(261.8, frame.gyro[i][Y], 1.0);
++        }
++    }
++}
++
++TEST(TelemetryCrsfImuTest, IntervalIsWholeNumberOfPidLoops)
++{
++    configureImu(true, 3333, 8, CRSF_IMU_ACCEL_OFF, 5);
++    crsfImuInit(250, true, (uint16_t)accOneG);
++    EXPECT_EQ(3250, crsfImuIntervalUs());     // 13 loops
++
++    configureImu(true, 100, 8, CRSF_IMU_ACCEL_OFF, 5);      // below minimum: clamped
++    crsfImuInit(250, true, (uint16_t)accOneG);
++    EXPECT_EQ(1000, crsfImuIntervalUs());
++
++    configureImu(true, 5000, 8, CRSF_IMU_ACCEL_ON, 5);      // no accelerometer: gyro only
++    crsfImuInit(250, false, 0);
++    EXPECT_EQ(8, crsfImuBatchSize());
++    const float gyroDps[3] = { 1.0f, 2.0f, 3.0f };
++    const std::vector<crsfImuFrameData_t> frames = runAccumulator(160, gyroDps, NULL);
++    ASSERT_EQ(1u, frames.size());
++    EXPECT_EQ(CRSF_IMU_ACCEL_OFF, (frames[0].flags & CRSF_IMU_FLAG_ACCEL_MASK) >> CRSF_IMU_FLAG_ACCEL_SHIFT);
++}
++
++// ---------------------------------------------------------------------------
++// 4. Saturation: no wrap-around, flag set, next interval clean
++
++TEST(TelemetryCrsfImuTest, SaturationClipsWithoutWrap)
++{
++    configureImu(true, 20000, 2, CRSF_IMU_ACCEL_ON, 5);
++    crsfImuInit(250, true, (uint16_t)accOneG);
++
++    const float hugeDps[3] = { 1e6f, -1e6f, 0.0f };
++    const float hugeAcc[3] = { 100.0f * accOneG, -100.0f * accOneG, 0.0f };
++    std::vector<crsfImuFrameData_t> frames = runAccumulator(80 * 2, hugeDps, hugeAcc);
++    ASSERT_EQ(1u, frames.size());
++    EXPECT_TRUE(frames[0].flags & CRSF_IMU_FLAG_SATURATED);
++    for (int i = 0; i < 2; i++) {
++        EXPECT_EQ(32767, frames[0].gyro[i][X]);
++        EXPECT_EQ(-32767, frames[0].gyro[i][Y]);
++        EXPECT_EQ(0, frames[0].gyro[i][Z]);
++        EXPECT_EQ(32767, frames[0].accel[i][X]);
++        EXPECT_EQ(-32767, frames[0].accel[i][Y]);
++    }
++
++    // back to a normal rate: the clipped excess must not leak into later intervals
++    const float normalDps[3] = { 100.0f, -100.0f, 0.0f };
++    const float normalAcc[3] = { 0.0f, 0.0f, accOneG };
++    frames = runAccumulator(80 * 2, normalDps, normalAcc);
++    ASSERT_EQ(1u, frames.size());
++    EXPECT_FALSE(frames[0].flags & CRSF_IMU_FLAG_SATURATED);
++    EXPECT_NEAR(349.07, frames[0].gyro[0][X], 1.0);    // 100 deg/s * 20ms
++    EXPECT_NEAR(-349.07, frames[0].gyro[0][Y], 1.0);
++    EXPECT_NEAR(1961.3, frames[0].accel[0][Z], 1.0);   // 1 g * 20ms
++
++    const float nanDps[3] = { NAN, 0.0f, 0.0f };
++    frames = runAccumulator(80 * 2, nanDps, normalAcc);
++    ASSERT_EQ(1u, frames.size());
++    EXPECT_TRUE(frames[0].flags & CRSF_IMU_FLAG_SATURATED);
++}
++
++// ---------------------------------------------------------------------------
++// 5. Sequence numbers, timestamps and FC-side drops
++
++TEST(TelemetryCrsfImuTest, SequenceTimestampAndDrops)
++{
++    configureImu(true, 5000, 4, CRSF_IMU_ACCEL_OFF, 5);
++    crsfImuInit(250, true, (uint16_t)accOneG);
++
++    const float gyroDps[3] = { 10.0f, 20.0f, 30.0f };
++    uint32_t t = 0xFFFF0000u;   // close to the micros() wrap
++    std::vector<crsfImuFrameData_t> frames;
++    for (int i = 0; i < 80 * 6; i++) {
++        t += 250;
++        crsfImuAccumulate(gyroDps, NULL, t);
++        crsfImuFrameData_t frame;
++        if (crsfImuPopFrame(&frame)) {
++            frames.push_back(frame);
++        }
++    }
++    ASSERT_EQ(6u, frames.size());
++    for (size_t i = 0; i < frames.size(); i++) {
++        EXPECT_EQ(i, frames[i].seq);
++        EXPECT_EQ(5000, frames[i].intervalUs);
++        EXPECT_EQ(0, frames[i].flags & CRSF_IMU_FLAG_FC_DROPPED);
++        // end of the last interval = time of the PID loop that completed it
++        EXPECT_EQ((uint32_t)(0xFFFF0000u + (i + 1) * 20000), frames[i].endTimeUs);
++    }
++
++    // nobody pops for three frames: two are replaced, the newest one carries the drop flag
++    for (int i = 0; i < 80 * 3; i++) {
++        t += 250;
++        crsfImuAccumulate(gyroDps, NULL, t);
++    }
++    crsfImuFrameData_t frame;
++    ASSERT_TRUE(crsfImuPopFrame(&frame));
++    EXPECT_EQ(8, frame.seq);    // 6 and 7 never left the FC
++    EXPECT_TRUE(frame.flags & CRSF_IMU_FLAG_FC_DROPPED);
++    EXPECT_FALSE(crsfImuPopFrame(&frame));
++
++    // the flag is cleared once a frame got out
++    for (int i = 0; i < 80; i++) {
++        t += 250;
++        crsfImuAccumulate(gyroDps, NULL, t);
++    }
++    ASSERT_TRUE(crsfImuPopFrame(&frame));
++    EXPECT_EQ(9, frame.seq);
++    EXPECT_FALSE(frame.flags & CRSF_IMU_FLAG_FC_DROPPED);
++}
++
++TEST(TelemetryCrsfImuTest, StateFlags)
++{
++    DISABLE_ARMING_FLAG(ARMED);
++    DISABLE_FLIGHT_MODE(ANGLE_MODE);
++    gyroCalibrated = true;
++    EXPECT_EQ(0, crsfImuStateFlags());
++
++    ENABLE_ARMING_FLAG(ARMED);
++    ENABLE_FLIGHT_MODE(ANGLE_MODE);
++    gyroCalibrated = false;
++    EXPECT_EQ(CRSF_IMU_FLAG_ARMED | CRSF_IMU_FLAG_ANGLE_MODE | CRSF_IMU_FLAG_GYRO_NOT_READY, crsfImuStateFlags());
++
++    DISABLE_ARMING_FLAG(ARMED);
++    DISABLE_FLIGHT_MODE(ANGLE_MODE);
++    gyroCalibrated = true;
++}
++
++// ---------------------------------------------------------------------------
++// 6. Telemetry ON: IMU frames are sent first, regular frames keep flowing at the reduced rate
++
++TEST(TelemetryCrsfImuTest, OnSendsImuFramesAndKeepsRegularTelemetry)
++{
++    configureImu(true, 5000, 8, CRSF_IMU_ACCEL_OFF, 5);
++    startCrsfTelemetry();
++    ASSERT_TRUE(crsfImuActive);
++    EXPECT_EQ(5, crsfImuStdTlmDiv());
++
++    const float gyroDps[3] = { 0.0f, 0.0f, 500.0f };
++    const float accRaw[3] = { 0.0f, 0.0f, accOneG };
++    advanceTo((testTimeUs / 100000 + 1) * 100000);
++    runLoops(10000000, gyroDps, accRaw);    // 10 s
++
++    const int imuFrames = countType(CRSF_IMU_DEFAULT_FRAME_TYPE);
++    EXPECT_NEAR(250, imuFrames, 1);         // 40 ms per frame
++    // regular frames: 4 types, each at 10 Hz / 5 = 2 Hz nominal. The stock scheduler runs on 2ms ticks
++    // (26ms slots without V3) and a slot that collides with an IMU frame moves by one more tick.
++    EXPECT_NEAR(19, countType(0x1E), 2);
++    EXPECT_NEAR(19, countType(0x08), 2);
++    EXPECT_NEAR(19, countType(0x21), 2);
++    EXPECT_NEAR(19, countType(0x02), 2);
++#if defined(USE_CRSF_V3)
++    // heartbeats fill the skipped slots: the receiver still gets an FC frame every ~20ms
++    EXPECT_NEAR(500 - 4 * 19, countType(0x0B), 25);
++    uint32_t lastRegularUs = 0;
++    for (const CapturedFrame &f : capturedFrames) {
++        if (f.type() == CRSF_IMU_DEFAULT_FRAME_TYPE) {
++            continue;
++        }
++        if (lastRegularUs) {
++            EXPECT_LE(f.timeUs - lastRegularUs, 24000u);
++        }
++        lastRegularUs = f.timeUs;
++    }
++#else
++    EXPECT_EQ(0, countType(0x0B));
++#endif
++
++    uint16_t expectedSeq = 0;
++    bool first = true;
++    uint32_t previousEnd = 0;
++    for (const CapturedFrame &f : capturedFrames) {
++        expectValidCrsfFrame(f.bytes);
++        if (f.type() != CRSF_IMU_DEFAULT_FRAME_TYPE) {
++            continue;
++        }
++        const uint8_t *d = &f.bytes[5];
++        EXPECT_EQ(62, f.bytes[1]);
++        EXPECT_EQ(CRSF_ADDRESS_RADIO_TRANSMITTER, f.bytes[3]);
++        EXPECT_EQ(CRSF_ADDRESS_FLIGHT_CONTROLLER, f.bytes[4]);
++        EXPECT_EQ(CRSF_IMU_FORMAT_VERSION, d[0]);
++        EXPECT_EQ(0, d[1]);
++        const uint16_t seq = beU16(&d[2]);
++        const uint32_t endTimeUs = beU32(&d[4]);
++        if (!first) {
++            EXPECT_EQ(expectedSeq, seq);    // nothing dropped: the telemetry task keeps up
++            EXPECT_EQ(40000u, endTimeUs - previousEnd);
++        }
++        first = false;
++        expectedSeq = seq + 1;
++        previousEnd = endTimeUs;
++        EXPECT_EQ(5000, beU16(&d[8]));
++        // frame leaves the FC at most one telemetry tick (2ms) after the batch completed
++        EXPECT_LE(f.timeUs - endTimeUs, 2000u);
++        for (int i = 0; i < 8; i++) {
++            EXPECT_NEAR(436.3, be16(&d[10 + i * 6 + 4]), 1.0);
++        }
++    }
++
++    // turning it off again restores the stock behaviour
++    configureImu(false, 5000, 8, CRSF_IMU_ACCEL_OFF, 5);
++    initCrsfTelemetry();
++    EXPECT_FALSE(crsfImuActive);
++    EXPECT_EQ(1, crsfImuStdTlmDiv());
++}
++
++TEST(TelemetryCrsfImuTest, DividerOneKeepsRegularRate)
++{
++    configureImu(true, 10000, 8, CRSF_IMU_ACCEL_OFF, 1);
++    startCrsfTelemetry();
++    const float gyroDps[3] = { 0.0f, 0.0f, 0.0f };
++    const float accRaw[3] = { 0.0f, 0.0f, accOneG };
++    advanceTo((testTimeUs / 100000 + 1) * 100000);
++    runLoops(10000000, gyroDps, accRaw);
++
++    EXPECT_NEAR(125, countType(CRSF_IMU_DEFAULT_FRAME_TYPE), 1);   // 80 ms per frame
++    // the IMU frame takes a telemetry tick now and then, regular frames still ~10 Hz each
++    EXPECT_NEAR(96, countType(0x1E), 4);
++    EXPECT_NEAR(96, countType(0x08), 4);
++}
++
++// STUBS
++
++extern "C" {
++
++// CRSF IMU telemetry dependencies
++uint32_t targetPidLooptime;
++acc_t acc;
++bool gyroIsCalibrationComplete(void) { return gyroCalibrated; }
++
++int16_t debug[DEBUG16_VALUE_COUNT];
++
++const uint32_t baudRates[] = {0, 9600, 19200, 38400, 57600, 115200, 230400, 250000, 400000}; // see baudRate_e
++
++attitudeEulerAngles_t attitude = { { 0, 0, 0 } };
++
++uint16_t GPS_distanceToHome;
++gpsSolutionData_t gpsSol;
++
++uint32_t micros(void) { return testTimeUs; }
++uint32_t microsISR(void) { return micros(); }
++
++bool featureIsEnabled(uint32_t) { return true; }
++void beeperConfirmationBeeps(uint8_t) {}
++
++static serialPort_t testSerialPort;
++static serialPortConfig_t testSerialPortConfig;
++
++uint32_t serialRxBytesWaiting(const serialPort_t *) { return 0; }
++uint32_t serialTxBytesFree(const serialPort_t *) { return 0; }
++uint8_t serialRead(serialPort_t *) { return 0; }
++void serialWrite(serialPort_t *, uint8_t) {}
++void serialWriteBuf(serialPort_t *, const uint8_t *data, int count)
++{
++    CapturedFrame frame;
++    frame.timeUs = testTimeUs;
++    frame.bytes.assign(data, data + count);
++    capturedFrames.push_back(frame);
++}
++void serialSetMode(serialPort_t *, portMode_e) {}
++serialPort_t *openSerialPort(serialPortIdentifier_e, serialPortFunction_e, serialReceiveCallbackPtr, void *, uint32_t, portMode_e, portOptions_e) { return &testSerialPort; }
++void closeSerialPort(serialPort_t *) {}
++bool isSerialTransmitBufferEmpty(const serialPort_t *) { return true; }
++
++const serialPortConfig_t *findSerialPortConfig(serialPortFunction_e) { return &testSerialPortConfig; }
++
++bool telemetryDetermineEnabledState(portSharing_e) { return true; }
++bool telemetryCheckRxPortShared(const serialPortConfig_t *, SerialRXType) { return true; }
++bool telemetryIsSensorEnabled(sensor_e) { return true; }
++
++portSharing_e determinePortSharing(const serialPortConfig_t *, serialPortFunction_e) { return PORTSHARING_NOT_SHARED; }
++
++bool airmodeIsEnabled(void) { return false; }
++
++int32_t getAmperage(void) { return 0; }
++uint16_t getBatteryVoltage(void) { return 380; }
++uint16_t getLegacyBatteryVoltage(void) { return 38; }
++uint16_t getBatteryAverageCellVoltage(void) { return 380; }
++batteryState_e getBatteryState(void) { return BATTERY_OK; }
++uint8_t calculateBatteryPercentageRemaining(void) { return 67; }
++int32_t getEstimatedAltitudeCm(void) { return 0; }
++int32_t getMAhDrawn(void) { return 0; }
++
++#if !defined(USE_MSP_OVER_TELEMETRY)
++bool sendMspReply(uint8_t, mspResponseFnPtr) { return false; }
++bool handleMspFrame(uint8_t *, uint8_t, uint8_t *) { return false; }
++#endif
++bool isBatteryVoltageConfigured(void) { return true; }
++bool isAmperageConfigured(void) { return true; }
++timeUs_t rxFrameTimeUs(void) { return 0; }
++
++#if defined(USE_MSP_OVER_TELEMETRY)
++bool isEepromWriteInProgress(void) { return false; }
++mspDescriptor_t mspDescriptorAlloc(void) { return 0; }
++mspResult_e mspFcProcessCommand(mspDescriptor_t, mspPacket_t *, mspPacket_t *, mspPostProcessFnPtr *) { return MSP_RESULT_NO_REPLY; }
++#endif
++#if defined(USE_CRSF_V3)
++uint32_t persistentObjectRead(persistentObjectId_e) { return 0; }
++void persistentObjectWrite(persistentObjectId_e, uint32_t) {}
++void serialSetBaudRate(serialPort_t *, uint32_t) {}
++#endif
++}
+diff --git a/src/test/unit/telemetry_crsf_imu_v3_unittest.cc b/src/test/unit/telemetry_crsf_imu_v3_unittest.cc
+new file mode 100644
+index 0000000..53405fb
+--- /dev/null
++++ b/src/test/unit/telemetry_crsf_imu_v3_unittest.cc
+@@ -0,0 +1,23 @@
++/*
++ * This file is part of Betaflight.
++ *
++ * Betaflight is free software. You can redistribute this software
++ * and/or modify this software under the terms of the GNU General
++ * Public License as published by the Free Software Foundation,
++ * either version 3 of the License, or (at your option) any later
++ * version.
++ *
++ * Betaflight is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
++ *
++ * See the GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public
++ * License along with this software.
++ *
++ * If not, see <http://www.gnu.org/licenses/>.
++ */
++
++// Same tests with USE_CRSF_V3, as in the real firmware: the schedule is padded with heartbeat frames.
++#include "telemetry_crsf_imu_unittest.cc"
+diff --git a/src/test/unit/telemetry_crsf_msp_unittest.cc b/src/test/unit/telemetry_crsf_msp_unittest.cc
+index ef0f4e3..3d03f50 100644
+--- a/src/test/unit/telemetry_crsf_msp_unittest.cc
++++ b/src/test/unit/telemetry_crsf_msp_unittest.cc
+@@ -254,6 +254,12 @@ TEST(CrossFireMSPTest, SendMspReply)
+ 
+ extern "C" {
+ 
++// CRSF IMU telemetry dependencies
++uint32_t targetPidLooptime;
++acc_t acc;
++bool gyroIsCalibrationComplete(void) { return true; }
++
++
+     gpsSolutionData_t gpsSol;
+     attitudeEulerAngles_t attitude = { { 0, 0, 0 } };
+     extern uint8_t responseBuffer[MSP_TLM_OUTBUF_SIZE];
+diff --git a/src/test/unit/telemetry_crsf_unittest.cc b/src/test/unit/telemetry_crsf_unittest.cc
+index 270a085..8f89305 100644
+--- a/src/test/unit/telemetry_crsf_unittest.cc
++++ b/src/test/unit/telemetry_crsf_unittest.cc
+@@ -303,6 +303,12 @@ TEST(TelemetryCrsfTest, TestFlightMode)
+ 
+ extern "C" {
+ 
++// CRSF IMU telemetry dependencies
++uint32_t targetPidLooptime;
++acc_t acc;
++bool gyroIsCalibrationComplete(void) { return true; }
++
++
+ int16_t debug[DEBUG16_VALUE_COUNT];
+ 
+ const uint32_t baudRates[] = {0, 9600, 19200, 38400, 57600, 115200, 230400, 250000, 400000}; // see baudRate_e
+diff --git a/src/test/unit/vtx_unittest.cc b/src/test/unit/vtx_unittest.cc
+index 058d942..b7529e3 100644
+--- a/src/test/unit/vtx_unittest.cc
++++ b/src/test/unit/vtx_unittest.cc
+@@ -127,6 +127,9 @@ TEST(VtxTest, PitMode)
+ 
+ // STUBS
+ extern "C" {
++    bool crsfImuActive = false;
++    gyro_t gyro;
++    void crsfImuAccumulate(const float *, const float *, timeUs_t) {}
+     uint8_t activePidLoopDenom = 1;
+     uint32_t micros(void) { return simulationTime; }
+     uint32_t millis(void) { return micros() / 1000; }
+-- 
+2.43.0
+
