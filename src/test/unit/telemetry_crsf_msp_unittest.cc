@@ -254,6 +254,12 @@ TEST(CrossFireMSPTest, SendMspReply)
 
 extern "C" {
 
+// CRSF IMU telemetry dependencies
+uint32_t targetPidLooptime;
+acc_t acc;
+bool gyroIsCalibrationComplete(void) { return true; }
+
+
     gpsSolutionData_t gpsSol;
     attitudeEulerAngles_t attitude = { { 0, 0, 0 } };
     extern uint8_t responseBuffer[MSP_TLM_OUTBUF_SIZE];

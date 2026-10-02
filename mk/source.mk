@@ -183,6 +183,7 @@ COMMON_SRC = \
             sensors/rangefinder.c \
             telemetry/telemetry.c \
             telemetry/crsf.c \
+            telemetry/crsf_imu.c \
             telemetry/ghst.c \
             telemetry/srxl.c \
             telemetry/frsky_hub.c \
@@ -345,6 +346,7 @@ SPEED_OPTIMISED_SRC := $(SPEED_OPTIMISED_SRC) \
             sensors/acceleration.c \
             sensors/boardalignment.c \
             sensors/gyro.c \
+            telemetry/crsf_imu.c \
             $(CMSIS_SRC) \
             $(DEVICE_STDPERIPH_SRC) \
 

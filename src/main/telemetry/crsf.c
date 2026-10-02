@@ -49,6 +49,7 @@
 #include "fc/runtime_config.h"
 
 #include "flight/imu.h"
+#include "flight/pid.h"
 #include "flight/position.h"
 
 #include "io/displayport_crsf.h"
@@ -61,11 +62,13 @@
 #include "rx/crsf.h"
 #include "rx/crsf_protocol.h"
 
+#include "sensors/acceleration.h"
 #include "sensors/battery.h"
 #include "sensors/sensors.h"
 
 #include "telemetry/telemetry.h"
 #include "telemetry/msp_shared.h"
+#include "telemetry/crsf_imu.h"
 
 #include "crsf.h"
 
@@ -663,8 +666,19 @@ static void processCrsf(void)
     }
 
     static uint8_t crsfScheduleIndex = 0;
+    static uint8_t crsfImuStdTlmCycle = 0;
 
-    const uint8_t currentSchedule = crsfSchedule[crsfScheduleIndex];
+    uint8_t currentSchedule = crsfSchedule[crsfScheduleIndex];
+
+    if (crsfImuStdTlmCycle != 0) {
+        // IMU telemetry is active: regular frames are only sent every crsfImuStdTlmDiv() schedule cycles.
+        // With CRSF V3 a heartbeat takes their slot, so the receiver still gets a frame at least every 20ms.
+#if defined(USE_CRSF_V3)
+        currentSchedule = BIT(CRSF_FRAME_HEARTBEAT_INDEX);
+#else
+        currentSchedule = 0;
+#endif
+    }
 
     sbuf_t crsfPayloadBuf;
     sbuf_t *dst = &crsfPayloadBuf;
@@ -702,6 +716,9 @@ static void processCrsf(void)
 #endif
 
     crsfScheduleIndex = (crsfScheduleIndex + 1) % crsfScheduleCount;
+    if (crsfScheduleIndex == 0) {
+        crsfImuStdTlmCycle = (crsfImuStdTlmCycle + 1) % crsfImuStdTlmDiv();
+    }
 }
 
 void crsfScheduleDeviceInfoResponse(void)
@@ -772,6 +789,12 @@ void initCrsfTelemetry(void)
 
 #if defined(USE_CRSF_CMS_TELEMETRY)
     crsfDisplayportRegister();
+#endif
+
+#if defined(USE_ACC)
+    crsfImuInit(targetPidLooptime, sensors(SENSOR_ACC), acc.dev.acc_1G);
+#else
+    crsfImuInit(targetPidLooptime, false, 0);
 #endif
 }
 
@@ -916,6 +939,19 @@ void handleCrsfTelemetry(timeUs_t currentTimeUs)
         }
     }
 #endif
+
+    // IMU frames go ahead of the regular schedule, without delaying it by more than one call
+    if (crsfImuIsActive()) {
+        crsfImuFrameData_t imuFrame;
+        if (crsfImuPopFrame(&imuFrame)) {
+            sbuf_t crsfImuBuf;
+            sbuf_t *dst = &crsfImuBuf;
+            crsfInitializeFrame(dst);
+            crsfImuSerializeFrame(dst, &imuFrame, crsfImuFrameType(), crsfImuStateFlags());
+            crsfFinalize(dst);
+            return;
+        }
+    }
 
     // Actual telemetry data only needs to be sent at a low frequency, ie 10Hz
     // Spread out scheduled frames evenly so each frame is sent at the same frequency.

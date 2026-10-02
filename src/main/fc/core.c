@@ -104,6 +104,7 @@
 #include "sensors/gyro.h"
 
 #include "telemetry/telemetry.h"
+#include "telemetry/crsf_imu.h"
 
 #include "core.h"
 
@@ -1294,6 +1295,15 @@ FAST_CODE void taskMainPidLoop(timeUs_t currentTimeUs)
     subTaskRcCommand(currentTimeUs);
     subTaskPidController(currentTimeUs);
     subTaskMotorUpdate(currentTimeUs);
+#ifdef USE_TELEMETRY_CRSF
+    if (crsfImuActive) {
+#ifdef USE_ACC
+        crsfImuAccumulate(gyro.gyroADCf, acc.accADC, currentTimeUs);
+#else
+        crsfImuAccumulate(gyro.gyroADCf, NULL, currentTimeUs);
+#endif
+    }
+#endif
     subTaskPidSubprocesses(currentTimeUs);
 
     DEBUG_SET(DEBUG_CYCLETIME, 0, getTaskDeltaTimeUs(TASK_SELF));

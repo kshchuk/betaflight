@@ -145,6 +145,9 @@ typedef enum {
     TABLE_FREQ_DOMAIN,
     TABLE_SWITCH_MODE,
 #endif
+#ifdef USE_TELEMETRY_CRSF
+    TABLE_CRSF_IMU_ACCEL,
+#endif
     LOOKUP_TABLE_COUNT
 } lookupTableIndex_e;
 

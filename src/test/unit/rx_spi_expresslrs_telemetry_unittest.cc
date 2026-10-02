@@ -390,6 +390,12 @@ TEST(RxSpiExpressLrsTelemetryUnitTest, TestDeviceInfoResp)
 
 extern "C" {
 
+// CRSF IMU telemetry dependencies
+uint32_t targetPidLooptime;
+acc_t acc;
+bool gyroIsCalibrationComplete(void) { return true; }
+
+
     attitudeEulerAngles_t attitude = { { 0, 0, 0 } };     // absolute angle inclination in multiple of 0.1 degree    180 deg = 1800
     gpsSolutionData_t gpsSol;
     rssiSource_e rssiSource;

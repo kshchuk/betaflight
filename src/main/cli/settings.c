@@ -128,6 +128,7 @@
 
 #include "telemetry/frsky_hub.h"
 #include "telemetry/ibus_shared.h"
+#include "telemetry/crsf_imu.h"
 #include "telemetry/telemetry.h"
 
 #include "settings.h"
@@ -169,6 +170,12 @@ const char * const lookupTableRangefinderHardware[] = {
 const char * const lookupTableOffOn[] = {
     "OFF", "ON"
 };
+
+#ifdef USE_TELEMETRY_CRSF
+static const char * const lookupTableCrsfImuAccel[] = {
+    "OFF", "ON", "FRAME"
+};
+#endif
 
 static const char * const lookupTableCrashRecovery[] = {
     "OFF", "ON" ,"BEEP", "DISARM"
@@ -653,6 +660,9 @@ const lookupTableEntry_t lookupTables[] = {
 #ifdef USE_RX_EXPRESSLRS
     LOOKUP_TABLE_ENTRY(lookupTableFreqDomain),
     LOOKUP_TABLE_ENTRY(lookupTableSwitchMode),
+#endif
+#ifdef USE_TELEMETRY_CRSF
+    LOOKUP_TABLE_ENTRY(lookupTableCrsfImuAccel),
 #endif
 };
 
@@ -1312,6 +1322,15 @@ const clivalue_t valueTable[] = {
     { "telemetry_disabled_cap_used",        VAR_UINT32  | MASTER_VALUE | MODE_BITSET, .config.bitpos = LOG2(SENSOR_CAP_USED),        PG_TELEMETRY_CONFIG, offsetof(telemetryConfig_t, disabledSensors)},
 #else
     { "telemetry_disabled_sensors", VAR_UINT32 | MASTER_VALUE, .config.u32Max = SENSOR_ALL, PG_TELEMETRY_CONFIG, offsetof(telemetryConfig_t, disabledSensors)},
+#endif
+#ifdef USE_TELEMETRY_CRSF
+// PG_CRSF_IMU_CONFIG
+    { "crsf_imu_telemetry",         VAR_UINT8  | MASTER_VALUE | MODE_LOOKUP, .config.lookup = { TABLE_OFF_ON }, PG_CRSF_IMU_CONFIG, offsetof(crsfImuConfig_t, enabled) },
+    { "crsf_imu_interval_us",       VAR_UINT16 | MASTER_VALUE, .config.minmaxUnsigned = { CRSF_IMU_INTERVAL_US_MIN, CRSF_IMU_INTERVAL_US_MAX }, PG_CRSF_IMU_CONFIG, offsetof(crsfImuConfig_t, intervalUs) },
+    { "crsf_imu_batch",             VAR_UINT8  | MASTER_VALUE, .config.minmaxUnsigned = { 1, CRSF_IMU_BATCH_MAX }, PG_CRSF_IMU_CONFIG, offsetof(crsfImuConfig_t, batch) },
+    { "crsf_imu_accel",             VAR_UINT8  | MASTER_VALUE | MODE_LOOKUP, .config.lookup = { TABLE_CRSF_IMU_ACCEL }, PG_CRSF_IMU_CONFIG, offsetof(crsfImuConfig_t, accelMode) },
+    { "crsf_imu_frame_type",        VAR_UINT8  | MASTER_VALUE, .config.minmaxUnsigned = { 0x28, 0xFE }, PG_CRSF_IMU_CONFIG, offsetof(crsfImuConfig_t, frameType) },
+    { "crsf_imu_std_tlm_div",       VAR_UINT8  | MASTER_VALUE, .config.minmaxUnsigned = { 1, CRSF_IMU_STD_TLM_DIV_MAX }, PG_CRSF_IMU_CONFIG, offsetof(crsfImuConfig_t, stdTlmDiv) },
 #endif
 #endif // USE_TELEMETRY
 

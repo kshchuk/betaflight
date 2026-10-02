@@ -303,6 +303,12 @@ TEST(TelemetryCrsfTest, TestFlightMode)
 
 extern "C" {
 
+// CRSF IMU telemetry dependencies
+uint32_t targetPidLooptime;
+acc_t acc;
+bool gyroIsCalibrationComplete(void) { return true; }
+
+
 int16_t debug[DEBUG16_VALUE_COUNT];
 
 const uint32_t baudRates[] = {0, 9600, 19200, 38400, 57600, 115200, 230400, 250000, 400000}; // see baudRate_e

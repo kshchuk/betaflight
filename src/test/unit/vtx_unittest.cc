@@ -127,6 +127,9 @@ TEST(VtxTest, PitMode)
 
 // STUBS
 extern "C" {
+    bool crsfImuActive = false;
+    gyro_t gyro;
+    void crsfImuAccumulate(const float *, const float *, timeUs_t) {}
     uint8_t activePidLoopDenom = 1;
     uint32_t micros(void) { return simulationTime; }
     uint32_t millis(void) { return micros() / 1000; }
